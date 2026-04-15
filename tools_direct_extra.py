@@ -16,7 +16,7 @@ def _result(data):
     return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
 
 
-async def _api(client, service, method, params, *, base_url, token, login="", timeout=120):
+async def _api(client, service, method, params, *, base_url, token, login="", timeout=120, **_kwargs):
     url = f"{base_url}/{service}"
     body = {"method": method, "params": params}
     headers = {"Authorization": f"Bearer {token}", "Accept-Language": "ru", "Content-Type": "application/json"}
@@ -31,7 +31,7 @@ async def _api(client, service, method, params, *, base_url, token, login="", ti
     return data
 
 
-async def _api501(client, service, method, params, *, base_url, token, login="", timeout=120):
+async def _api501(client, service, method, params, *, base_url, token, login="", timeout=120, **_kwargs):
     """Call via v501 endpoint (for shopping ads, callout linking, etc.)."""
     url = base_url.replace("/v5", "/v501") + f"/{service}"
     body = {"method": method, "params": params}
@@ -646,9 +646,170 @@ _HANDLER_MAP = {
 }
 
 
+# ── ExcludedSites ──────────────────────────────────────────────────────
+
+async def _handle_excluded_sites_get(client, args, config):
+    data = await _api(client, "campaigns", "get", {
+        "SelectionCriteria": {"Ids": [args["campaign_id"]]},
+        "FieldNames": ["Id", "Name", "ExcludedSites"],
+    }, **config)
+    camps = data.get("result", {}).get("Campaigns", [])
+    if camps:
+        sites = camps[0].get("ExcludedSites", {}).get("Items", [])
+        return _result({"campaign_id": args["campaign_id"], "excluded_sites": sites, "count": len(sites)})
+    return _result({"error": "Campaign not found"})
+
+
+async def _handle_excluded_sites_update(client, args, config):
+    data = await _api(client, "campaigns", "update", {
+        "Campaigns": [{
+            "Id": args["campaign_id"],
+            "ExcludedSites": {"Items": args["sites"]},
+        }]
+    }, **config)
+    return _result(data.get("result", data))
+
+
+async def _handle_blocked_ips_update(client, args, config):
+    data = await _api(client, "campaigns", "update", {
+        "Campaigns": [{
+            "Id": args["campaign_id"],
+            "BlockedIps": {"Items": args["ips"]},
+        }]
+    }, **config)
+    return _result(data.get("result", data))
+
+
+# ── Campaign Strategy Update ──────────────────────────────────────────
+
+async def _handle_campaign_strategy_update(client, args, config):
+    """Update campaign bidding strategy (CPA, weekly limit, goal, strategy type)."""
+    campaign = {"Id": args["campaign_id"], "TextCampaign": {"BiddingStrategy": {}}}
+    strategy = campaign["TextCampaign"]["BiddingStrategy"]
+
+    search_type = args.get("strategy_search")
+    network_type = args.get("strategy_network")
+
+    if search_type:
+        search_obj = {"BiddingStrategyType": search_type}
+        if search_type == "PAY_FOR_CONVERSION":
+            params = {}
+            if args.get("goal_id"):
+                params["GoalId"] = args["goal_id"]
+            if args.get("cpa"):
+                params["Cpa"] = int(args["cpa"] * 1_000_000)
+            if args.get("weekly_spend_limit"):
+                params["WeeklySpendLimit"] = int(args["weekly_spend_limit"] * 1_000_000)
+            search_obj["PayForConversion"] = params
+        elif search_type == "WB_MAXIMUM_CLICKS":
+            params = {}
+            if args.get("weekly_spend_limit"):
+                params["WeeklySpendLimit"] = int(args["weekly_spend_limit"] * 1_000_000)
+            search_obj["WbMaximumClicks"] = params
+        elif search_type == "WB_MAXIMUM_CONVERSION_RATE":
+            params = {}
+            if args.get("goal_id"):
+                params["GoalId"] = args["goal_id"]
+            if args.get("weekly_spend_limit"):
+                params["WeeklySpendLimit"] = int(args["weekly_spend_limit"] * 1_000_000)
+            search_obj["WbMaximumConversionRate"] = params
+        elif search_type == "SERVING_OFF":
+            pass
+        strategy["Search"] = search_obj
+
+    if network_type:
+        network_obj = {"BiddingStrategyType": network_type}
+        if network_type == "WB_MAXIMUM_CONVERSION_RATE":
+            params = {}
+            if args.get("goal_id"):
+                params["GoalId"] = args["goal_id"]
+            if args.get("weekly_spend_limit"):
+                params["WeeklySpendLimit"] = int(args["weekly_spend_limit"] * 1_000_000)
+            network_obj["WbMaximumConversionRate"] = params
+        elif network_type == "WB_MAXIMUM_CLICKS":
+            params = {}
+            if args.get("weekly_spend_limit"):
+                params["WeeklySpendLimit"] = int(args["weekly_spend_limit"] * 1_000_000)
+            network_obj["WbMaximumClicks"] = params
+        elif network_type == "NETWORK_DEFAULT":
+            network_obj["NetworkDefault"] = {"LimitPercent": 100}
+        elif network_type == "SERVING_OFF":
+            pass
+        strategy["Network"] = network_obj
+
+    data = await _api(client, "campaigns", "update", {"Campaigns": [campaign]}, **config)
+    return _result(data.get("result", data))
+
+
+# ── Tool definitions for new tools ────────────────────────────────────
+
+_NEW_TOOLS = [
+    Tool(
+        name="yd_excluded_sites_get",
+        description="Get list of excluded sites (blocked placements) for a campaign.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+            },
+            "required": ["campaign_id"],
+        },
+    ),
+    Tool(
+        name="yd_excluded_sites_update",
+        description="Set excluded sites (blocked placements) for a campaign. Replaces entire list.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "sites": {"type": "array", "items": {"type": "string"}, "description": "List of sites to exclude (e.g. ['games.yandex.ru', 'AdsNative', 'example.com'])"},
+            },
+            "required": ["campaign_id", "sites"],
+        },
+    ),
+    Tool(
+        name="yd_blocked_ips_update",
+        description="Set blocked IPs for a campaign (max 25). Only exact IPs, no subnets.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "ips": {"type": "array", "items": {"type": "string"}, "description": "List of IPs to block (e.g. ['1.2.3.4', '5.6.7.8'])"},
+            },
+            "required": ["campaign_id", "ips"],
+        },
+    ),
+    Tool(
+        name="yd_campaign_strategy_update",
+        description="Update campaign bidding strategy. Change CPA, weekly limit, goal, or strategy type.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "strategy_search": {"type": "string", "enum": ["PAY_FOR_CONVERSION", "WB_MAXIMUM_CLICKS", "WB_MAXIMUM_CONVERSION_RATE", "SERVING_OFF"], "description": "Search strategy type"},
+                "strategy_network": {"type": "string", "enum": ["SERVING_OFF", "NETWORK_DEFAULT", "WB_MAXIMUM_CLICKS", "WB_MAXIMUM_CONVERSION_RATE"], "description": "Network strategy type"},
+                "cpa": {"type": "number", "description": "Target CPA in rubles (for PAY_FOR_CONVERSION)"},
+                "goal_id": {"type": "integer", "description": "Metrika goal ID"},
+                "weekly_spend_limit": {"type": "number", "description": "Weekly spend limit in rubles"},
+            },
+            "required": ["campaign_id"],
+        },
+    ),
+]
+
+
 def register_extra_direct_handlers(dispatch: dict):
     """Add all extra tool handlers to the dispatch dict.
 
     Each handler signature: async def handler(client, args, config) -> list[TextContent]
     """
     dispatch.update(_HANDLER_MAP)
+    # Add new operational tools
+    dispatch["yd_excluded_sites_get"] = _handle_excluded_sites_get
+    dispatch["yd_excluded_sites_update"] = _handle_excluded_sites_update
+    dispatch["yd_blocked_ips_update"] = _handle_blocked_ips_update
+    dispatch["yd_campaign_strategy_update"] = _handle_campaign_strategy_update
+
+
+# Append new tools to the main list
+EXTRA_DIRECT_TOOLS.extend(_NEW_TOOLS)
