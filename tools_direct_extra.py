@@ -4,10 +4,59 @@ import json
 import time
 import base64
 import logging
+import contextvars
 
 from mcp.types import Tool, TextContent
 
-logger = logging.getLogger("yandex-direct-mcp")
+logger = logging.getLogger("yandex-ads-mcp")
+
+# Per-call Client-Login (agency multi-account). Set by the dispatcher in server.py.
+client_login_var = contextvars.ContextVar("client_login", default="")
+
+# Toggled from server.py via set_log_bodies(); when False, request/response bodies are not logged.
+_LOG_BODIES = False
+
+
+def set_log_bodies(enabled: bool):
+    global _LOG_BODIES
+    _LOG_BODIES = bool(enabled)
+
+
+def _log_body(prefix, *args):
+    if _LOG_BODIES:
+        logger.debug(prefix, *args)
+
+
+def annotate_partial(data):
+    """Surface Yandex Direct per-item Errors/Warnings (partial success) at the top level.
+
+    Direct v5 returns 200 OK even when individual items fail; the failures live inside
+    result.<List>[i].Errors / .Warnings. Without this, a half-failed bulk add looks like success.
+    """
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        return data
+    issues = []
+    for key, val in result.items():
+        if not isinstance(val, list):
+            continue
+        for idx, item in enumerate(val):
+            if not isinstance(item, dict):
+                continue
+            if item.get("Errors"):
+                issues.append({"list": key, "index": idx, "level": "error", "messages": item["Errors"]})
+            if item.get("Warnings"):
+                issues.append({"list": key, "index": idx, "level": "warning", "messages": item["Warnings"]})
+    if issues:
+        error_count = sum(1 for i in issues if i["level"] == "error")
+        data = dict(data)
+        data["_partial_success"] = {
+            "ok": error_count == 0,
+            "error_count": error_count,
+            "warning_count": len(issues) - error_count,
+            "issues": issues,
+        }
+    return data
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -20,15 +69,16 @@ async def _api(client, service, method, params, *, base_url, token, login="", ti
     url = f"{base_url}/{service}"
     body = {"method": method, "params": params}
     headers = {"Authorization": f"Bearer {token}", "Accept-Language": "ru", "Content-Type": "application/json"}
-    if login:
-        headers["Client-Login"] = login
-    logger.debug("EXTRA REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
+    eff_login = client_login_var.get("") or login
+    if eff_login:
+        headers["Client-Login"] = eff_login
+    _log_body("EXTRA REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await client.post(url, headers=headers, json=body, timeout=timeout)
     data = resp.json()
-    logger.debug("EXTRA RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
+    _log_body("EXTRA RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
         raise Exception(f"API error {data['error'].get('error_code')}: {data['error'].get('error_detail', data['error'].get('error_string'))}")
-    return data
+    return annotate_partial(data)
 
 
 async def _api501(client, service, method, params, *, base_url, token, login="", timeout=120, **_kwargs):
@@ -36,15 +86,16 @@ async def _api501(client, service, method, params, *, base_url, token, login="",
     url = base_url.replace("/v5", "/v501") + f"/{service}"
     body = {"method": method, "params": params}
     headers = {"Authorization": f"Bearer {token}", "Accept-Language": "ru", "Content-Type": "application/json"}
-    if login:
-        headers["Client-Login"] = login
-    logger.debug("EXTRA v501 REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
+    eff_login = client_login_var.get("") or login
+    if eff_login:
+        headers["Client-Login"] = eff_login
+    _log_body("EXTRA v501 REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await client.post(url, headers=headers, json=body, timeout=timeout)
     data = resp.json()
-    logger.debug("EXTRA v501 RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
+    _log_body("EXTRA v501 RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
         raise Exception(f"API error {data['error'].get('error_code')}: {data['error'].get('error_detail', data['error'].get('error_string'))}")
-    return data
+    return annotate_partial(data)
 
 
 # IAM token cache (shared)

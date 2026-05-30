@@ -17,29 +17,61 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # ── Config ─────────────────────────────────────────────────────────────
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, "")
+    if v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 API_URL = os.environ.get("YD_API_URL", "https://api.direct.yandex.com/json/v5")
 SANDBOX_URL = "https://api-sandbox.direct.yandex.com/json/v5"
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat"
 TOKEN = os.environ.get("YD_OAUTH_TOKEN", "")
 YC_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "")
-USE_SANDBOX = os.environ.get("YD_SANDBOX", "").lower() in ("1", "true", "yes")
-LOGIN = os.environ.get("YD_LOGIN", "")  # optional, for agency accounts
+USE_SANDBOX = _env_bool("YD_SANDBOX")
+LOGIN = os.environ.get("YD_LOGIN", "")  # optional default Client-Login for agency accounts
 
-# ── Logging ────────────────────────────────────────────────────────────
-log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yandex-ads.log")
+# Safety / access control
+READONLY = _env_bool("YD_READONLY")   # block every mutating tool (add/update/delete/action/set/...)
+CONFIRM = _env_bool("YD_CONFIRM")     # require confirm=true on every mutating tool
+ALLOWED_LOGINS = [s.strip() for s in os.environ.get("YD_ALLOWED_LOGINS", "").split(",") if s.strip()]
+
+# Logging
+LOG_LEVEL = os.environ.get("YD_LOG_LEVEL", "INFO").upper()
+LOG_FILE = os.environ.get("YD_LOG_FILE", "")   # empty → stderr only (no file written)
+LOG_BODIES = _env_bool("YD_LOG_BODIES")        # dump request/response bodies (verbose; may contain ad data)
+
+# ── Logging setup ──────────────────────────────────────────────────────
 logger = logging.getLogger("yandex-ads-mcp")
-logger.setLevel(logging.DEBUG)
-fh = logging.FileHandler(log_file, encoding="utf-8")
-fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(fh)
-sh = logging.StreamHandler(sys.stderr)
-sh.setLevel(logging.INFO)
-sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(sh)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_sh = logging.StreamHandler(sys.stderr)
+_sh.setFormatter(_fmt)
+logger.addHandler(_sh)
+if LOG_FILE:
+    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+
+
+def _log_body(prefix, *args):
+    """Log request/response bodies only when YD_LOG_BODIES is enabled (verbose)."""
+    if LOG_BODIES:
+        logger.debug(prefix, *args)
+
 
 # ── Extra modules ──────────────────────────────────────────────────────
 from tools_metrika import METRIKA_TOOLS, register_metrika_handlers
-from tools_direct_extra import EXTRA_DIRECT_TOOLS, register_extra_direct_handlers
+from tools_direct_extra import (
+    EXTRA_DIRECT_TOOLS,
+    register_extra_direct_handlers,
+    client_login_var,
+    annotate_partial,
+    set_log_bodies,
+)
+
+set_log_bodies(LOG_BODIES)
 
 server = Server("yandex-ads")
 
@@ -48,14 +80,20 @@ def _base_url():
     return SANDBOX_URL if USE_SANDBOX else API_URL
 
 
+def _effective_login() -> str:
+    """Per-call Client-Login (multi-account) overrides the global default."""
+    return client_login_var.get("") or LOGIN
+
+
 def _headers():
     h = {
         "Authorization": f"Bearer {TOKEN}",
         "Accept-Language": "ru",
         "Content-Type": "application/json",
     }
-    if LOGIN:
-        h["Client-Login"] = LOGIN
+    login = _effective_login()
+    if login:
+        h["Client-Login"] = login
     return h
 
 
@@ -63,13 +101,45 @@ async def _api(client: httpx.AsyncClient, service: str, method: str, params: dic
     """Call Yandex Direct API v5."""
     url = f"{_base_url()}/{service}"
     body = {"method": method, "params": params}
-    logger.debug("REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
+    _log_body("REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await client.post(url, headers=_headers(), json=body, timeout=120)
     data = resp.json()
-    logger.debug("RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
+    _log_body("RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
         raise Exception(f"API error {data['error'].get('error_code')}: {data['error'].get('error_detail', data['error'].get('error_string'))}")
-    return data
+    return annotate_partial(data)
+
+
+# ── Access control ─────────────────────────────────────────────────────
+
+_MUTATING_TOKENS = ("_add", "_create", "_update", "_delete", "_action",
+                    "_set", "_toggle", "_link", "_unlink", "_upload")
+
+
+def _is_mutating(name: str) -> bool:
+    """True for any tool that changes state (create/update/delete/action/...)."""
+    return any(t in name for t in _MUTATING_TOKENS)
+
+
+def _is_direct(name: str) -> bool:
+    """True for Yandex Direct tools (which use Client-Login); Metrika/Wordstat don't."""
+    return name.startswith("yd_") and not name.startswith("yd_metrika") and not name.startswith("yd_wordstat")
+
+
+def _deny(reason: str):
+    logger.warning("DENIED: %s", reason)
+    return [TextContent(type="text", text=json.dumps({"denied": True, "reason": reason}, ensure_ascii=False))]
+
+
+def _confirm_preview(name: str, arguments: dict, login: str):
+    preview = {
+        "confirm_required": True,
+        "tool": name,
+        "client_login": login or None,
+        "arguments": arguments,
+        "note": "Mutating operation and YD_CONFIRM is enabled. Re-call this tool with confirm=true to execute.",
+    }
+    return [TextContent(type="text", text=json.dumps(preview, indent=2, ensure_ascii=False))]
 
 
 def _result(data):
@@ -906,9 +976,26 @@ TOOLS = [
 ]
 
 
+def _augment_schema(tool: Tool) -> Tool:
+    """Advertise the cross-cutting optional args (client_login, confirm) on tool schemas."""
+    schema = json.loads(json.dumps(tool.inputSchema or {"type": "object", "properties": {}}))
+    props = schema.setdefault("properties", {})
+    if _is_direct(tool.name):
+        props.setdefault("client_login", {
+            "type": "string",
+            "description": "Optional. Override Client-Login for this call (agency multi-account).",
+        })
+    if CONFIRM and _is_mutating(tool.name):
+        props.setdefault("confirm", {
+            "type": "boolean",
+            "description": "Must be true to execute this mutating call (YD_CONFIRM is enabled).",
+        })
+    return Tool(name=tool.name, description=tool.description, inputSchema=schema)
+
+
 @server.list_tools()
 async def list_tools():
-    return TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS
+    return [_augment_schema(t) for t in (TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS)]
 
 
 def _rubles_to_micros(rubles: float) -> int:
@@ -920,6 +1007,33 @@ def _rubles_to_micros(rubles: float) -> int:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    arguments = dict(arguments or {})
+    # Cross-cutting controls (not forwarded to the Yandex API)
+    req_login = arguments.pop("client_login", None)
+    confirm = bool(arguments.pop("confirm", False))
+    mutating = _is_mutating(name)
+
+    # 1) read-only mode
+    if mutating and READONLY:
+        return _deny(f"Tool '{name}' is blocked: server runs in READ-ONLY mode (YD_READONLY=true).")
+
+    # 2) multi-account whitelist (Direct tools only — Metrika/Wordstat ignore Client-Login)
+    effective_login = req_login or LOGIN
+    if _is_direct(name) and ALLOWED_LOGINS and effective_login and effective_login not in ALLOWED_LOGINS:
+        return _deny(f"Client-Login '{effective_login}' is not in the YD_ALLOWED_LOGINS whitelist.")
+
+    # 3) confirm gate
+    if mutating and CONFIRM and not confirm:
+        return _confirm_preview(name, arguments, effective_login)
+
+    ctx_token = client_login_var.set(req_login or "")
+    try:
+        return await _dispatch(name, arguments)
+    finally:
+        client_login_var.reset(ctx_token)
+
+
+async def _dispatch(name: str, arguments: dict):
     async with httpx.AsyncClient() as client:
         try:
             if name == "yd_campaigns_get":
@@ -1785,9 +1899,9 @@ async def _wordstat_request(client: httpx.AsyncClient, endpoint: str, body: dict
         "Authorization": f"Bearer {iam}",
         "Content-Type": "application/json",
     }
-    logger.debug("WORDSTAT REQUEST %s: %s", url, json.dumps(body, ensure_ascii=False)[:2000])
+    _log_body("WORDSTAT REQUEST %s: %s", url, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await client.post(url, headers=headers, json=body, timeout=60)
-    logger.debug("WORDSTAT RESPONSE %s: %s", resp.status_code, resp.text[:2000])
+    _log_body("WORDSTAT RESPONSE %s: %s", resp.status_code, resp.text[:2000])
     if resp.status_code == 429:
         raise Exception(f"Wordstat rate limit exceeded (429). Retry later.")
     if resp.status_code == 503:
