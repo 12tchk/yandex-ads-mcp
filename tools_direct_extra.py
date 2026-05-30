@@ -38,6 +38,19 @@ async def request_with_retry(client, url, *, headers, json_body, timeout, max_at
     return resp
 
 
+def log_units(resp):
+    """Log Yandex Direct API points from the Units header (format: spent/balance/limit)."""
+    u = resp.headers.get("Units")
+    if not u:
+        return
+    try:
+        spent, balance, limit = (int(x) for x in u.split("/"))
+        level = logging.WARNING if (limit and balance < limit * 0.05) else logging.INFO
+        logger.log(level, "Direct API units: balance %s/%s (spent %s on this call)", balance, limit, spent)
+    except Exception:
+        logger.info("Direct API units: %s", u)
+
+
 def iam_expiry(data, now):
     """Compute IAM token expiry epoch from the API's expiresAt, with an 11h fallback."""
     exp = data.get("expiresAt")
@@ -114,6 +127,7 @@ async def _api(client, service, method, params, *, base_url, token, login="", ti
         headers["Client-Login"] = eff_login
     _log_body("EXTRA REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=timeout)
+    log_units(resp)
     data = resp.json()
     _log_body("EXTRA RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
@@ -131,6 +145,7 @@ async def _api501(client, service, method, params, *, base_url, token, login="",
         headers["Client-Login"] = eff_login
     _log_body("EXTRA v501 REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=timeout)
+    log_units(resp)
     data = resp.json()
     _log_body("EXTRA v501 RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:

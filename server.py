@@ -71,6 +71,7 @@ from tools_direct_extra import (
     set_log_bodies,
     request_with_retry,
     iam_expiry,
+    log_units,
 )
 
 set_log_bodies(LOG_BODIES)
@@ -105,6 +106,7 @@ async def _api(client: httpx.AsyncClient, service: str, method: str, params: dic
     body = {"method": method, "params": params}
     _log_body("REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await request_with_retry(client, url, headers=_headers(), json_body=body, timeout=120)
+    log_units(resp)
     data = resp.json()
     _log_body("RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
