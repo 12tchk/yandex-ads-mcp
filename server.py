@@ -932,6 +932,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "phrase": {"type": "string", "description": "Keyword to analyze"},
+                "num_phrases": {"type": "integer", "description": "How many related phrases to return, 1-2000 (default 30)"},
                 "regions": {"type": "array", "items": {"type": "integer"}, "description": "Region IDs (optional, omit for all Russia)"},
                 "devices": {"type": "string", "enum": ["all", "desktop", "phone", "tablet"], "description": "Device filter (default: all)"},
             },
@@ -940,14 +941,14 @@ TOOLS = [
     ),
     Tool(
         name="yd_wordstat_dynamics",
-        description="Get search frequency dynamics over time for a keyword. Shows trends (monthly/weekly/daily).",
+        description="Get search frequency dynamics over time for a keyword. Date alignment is enforced by the API: monthly → both dates must be the 1st of a month; weekly → from=Monday, to=Sunday; daily → any dates.",
         inputSchema={
             "type": "object",
             "properties": {
                 "phrase": {"type": "string", "description": "Keyword to analyze"},
                 "period": {"type": "string", "enum": ["monthly", "weekly", "daily"], "description": "Time granularity"},
-                "from_date": {"type": "string", "description": "Start date YYYY-MM-DD"},
-                "to_date": {"type": "string", "description": "End date YYYY-MM-DD"},
+                "from_date": {"type": "string", "description": "Start date YYYY-MM-DD (monthly: 1st of month; weekly: a Monday)"},
+                "to_date": {"type": "string", "description": "End date YYYY-MM-DD (monthly: 1st of month; weekly: a Sunday)"},
                 "regions": {"type": "array", "items": {"type": "integer"}, "description": "Region IDs (optional)"},
                 "devices": {"type": "string", "enum": ["all", "desktop", "phone", "tablet"]},
             },
@@ -1913,7 +1914,10 @@ async def _wordstat_request(client: httpx.AsyncClient, endpoint: str, body: dict
 
 
 async def _handle_wordstat_top_requests(client, args):
-    body = {"phrase": args["phrase"]}
+    # The Wordstat /topRequests endpoint requires numPhrases (1..2000).
+    num = int(args.get("num_phrases", 30))
+    num = max(1, min(num, 2000))
+    body = {"phrase": args["phrase"], "numPhrases": num}
     if regions := args.get("regions"):
         body["regions"] = regions
     if devices := args.get("devices"):
@@ -1922,12 +1926,25 @@ async def _handle_wordstat_top_requests(client, args):
     return _result(data)
 
 
+def _rfc3339(d: str) -> str:
+    """Wordstat /dynamics wants protobuf Timestamps; accept a plain YYYY-MM-DD too."""
+    d = (d or "").strip()
+    return d if "T" in d else f"{d}T00:00:00Z"
+
+
+_WORDSTAT_PERIODS = {
+    "monthly": "PERIOD_MONTHLY", "weekly": "PERIOD_WEEKLY", "daily": "PERIOD_DAILY",
+    "PERIOD_MONTHLY": "PERIOD_MONTHLY", "PERIOD_WEEKLY": "PERIOD_WEEKLY", "PERIOD_DAILY": "PERIOD_DAILY",
+}
+
+
 async def _handle_wordstat_dynamics(client, args):
+    period = _WORDSTAT_PERIODS.get(args["period"], args["period"])
     body = {
         "phrase": args["phrase"],
-        "period": args["period"],
-        "fromDate": args["from_date"],
-        "toDate": args["to_date"],
+        "period": period,
+        "fromDate": _rfc3339(args["from_date"]),
+        "toDate": _rfc3339(args["to_date"]),
     }
     if regions := args.get("regions"):
         body["regions"] = regions
