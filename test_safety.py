@@ -80,6 +80,18 @@ check("mutating tool exposes confirm (YD_CONFIRM on)", "confirm" in add_props)
 metrika_props = tools["yd_metrika_report"].inputSchema["properties"]
 check("metrika report has no client_login", "client_login" not in metrika_props)
 
+print("== IAM expiresAt parsing ==")
+from tools_direct_extra import iam_expiry  # noqa: E402
+# 2026-05-30T13:00:00Z == epoch 1780146000
+exp = iam_expiry({"expiresAt": "2026-05-30T13:00:00Z"}, now=0)
+check("parses ISO Z to epoch (minus 60s safety)", abs(exp - (1780146000 - 60)) < 2)
+exp_ns = iam_expiry({"expiresAt": "2026-05-30T13:00:00.123456789Z"}, now=0)
+check("tolerates nanosecond precision", abs(exp_ns - (1780146000 - 60)) < 2)
+fb = iam_expiry({}, now=1000)
+check("falls back to now+11h when no expiresAt", fb == 1000 + 11 * 3600)
+bad = iam_expiry({"expiresAt": "not-a-date"}, now=2000)
+check("falls back on unparseable value", bad == 2000 + 11 * 3600)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")

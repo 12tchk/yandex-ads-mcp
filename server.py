@@ -69,6 +69,8 @@ from tools_direct_extra import (
     client_login_var,
     annotate_partial,
     set_log_bodies,
+    request_with_retry,
+    iam_expiry,
 )
 
 set_log_bodies(LOG_BODIES)
@@ -102,7 +104,7 @@ async def _api(client: httpx.AsyncClient, service: str, method: str, params: dic
     url = f"{_base_url()}/{service}"
     body = {"method": method, "params": params}
     _log_body("REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=_headers(), json=body, timeout=120)
+    resp = await request_with_retry(client, url, headers=_headers(), json_body=body, timeout=120)
     data = resp.json()
     _log_body("RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
@@ -1884,9 +1886,8 @@ async def _get_iam_token(client: httpx.AsyncClient) -> str:
     if "iamToken" not in data:
         raise Exception(f"Failed to get IAM token: {data}")
     _iam_token_cache["token"] = data["iamToken"]
-    # Parse expiresAt or default to 11 hours
-    _iam_token_cache["expires"] = now + 11 * 3600
-    logger.debug("Got new IAM token, expires in ~11h")
+    _iam_token_cache["expires"] = iam_expiry(data, now)
+    logger.debug("Got new IAM token (expiresAt=%s)", data.get("expiresAt"))
     return _iam_token_cache["token"]
 
 

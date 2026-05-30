@@ -1,14 +1,54 @@
 """Extra Yandex Direct API tools: VCards, Feeds, Smart targets, Ad types, Videos, Creatives, misc."""
 
+import re
 import json
 import time
 import base64
+import asyncio
 import logging
+import datetime
 import contextvars
 
 from mcp.types import Tool, TextContent
 
 logger = logging.getLogger("yandex-ads-mcp")
+
+# Transient HTTP statuses worth retrying with backoff.
+_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+async def request_with_retry(client, url, *, headers, json_body, timeout, max_attempts=4):
+    """POST with capped exponential backoff on transient errors / rate limits.
+
+    Honours Retry-After when present. Returns the final response (success or last failure).
+    """
+    delay = 1.0
+    resp = None
+    for attempt in range(1, max_attempts + 1):
+        resp = await client.post(url, headers=headers, json=json_body, timeout=timeout)
+        if resp.status_code in _RETRY_STATUS and attempt < max_attempts:
+            ra = resp.headers.get("Retry-After", "")
+            wait = float(ra) if ra.isdigit() else delay
+            logger.warning("HTTP %s from %s — retry %d/%d in %.1fs",
+                           resp.status_code, url, attempt, max_attempts - 1, wait)
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, 30.0)
+            continue
+        break
+    return resp
+
+
+def iam_expiry(data, now):
+    """Compute IAM token expiry epoch from the API's expiresAt, with an 11h fallback."""
+    exp = data.get("expiresAt")
+    if exp:
+        try:
+            s = exp.replace("Z", "+00:00")
+            s = re.sub(r"(\.\d{6})\d+", r"\1", s)  # trim sub-microsecond precision
+            return datetime.datetime.fromisoformat(s).timestamp() - 60
+        except Exception:
+            logger.debug("Could not parse IAM expiresAt=%r, using 11h fallback", exp)
+    return now + 11 * 3600
 
 # Per-call Client-Login (agency multi-account). Set by the dispatcher in server.py.
 client_login_var = contextvars.ContextVar("client_login", default="")
@@ -73,7 +113,7 @@ async def _api(client, service, method, params, *, base_url, token, login="", ti
     if eff_login:
         headers["Client-Login"] = eff_login
     _log_body("EXTRA REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=headers, json=body, timeout=timeout)
+    resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=timeout)
     data = resp.json()
     _log_body("EXTRA RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
@@ -90,7 +130,7 @@ async def _api501(client, service, method, params, *, base_url, token, login="",
     if eff_login:
         headers["Client-Login"] = eff_login
     _log_body("EXTRA v501 REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=headers, json=body, timeout=timeout)
+    resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=timeout)
     data = resp.json()
     _log_body("EXTRA v501 RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
@@ -114,7 +154,7 @@ async def _get_iam(client, oauth_token):
     if "iamToken" not in data:
         raise Exception(f"Failed to get IAM token: {data}")
     _iam_cache["token"] = data["iamToken"]
-    _iam_cache["expires"] = now + 11 * 3600
+    _iam_cache["expires"] = iam_expiry(data, now)
     return _iam_cache["token"]
 
 
