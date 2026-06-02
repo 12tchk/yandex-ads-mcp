@@ -1,13 +1,115 @@
 """Extra Yandex Direct API tools: VCards, Feeds, Smart targets, Ad types, Videos, Creatives, misc."""
 
+import re
 import json
 import time
 import base64
+import asyncio
 import logging
+import datetime
+import contextvars
 
 from mcp.types import Tool, TextContent
 
-logger = logging.getLogger("yandex-direct-mcp")
+logger = logging.getLogger("yandex-ads-mcp")
+
+# Transient HTTP statuses worth retrying with backoff.
+_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+async def request_with_retry(client, url, *, headers, json_body, timeout, max_attempts=4):
+    """POST with capped exponential backoff on transient errors / rate limits.
+
+    Honours Retry-After when present. Returns the final response (success or last failure).
+    """
+    delay = 1.0
+    resp = None
+    for attempt in range(1, max_attempts + 1):
+        resp = await client.post(url, headers=headers, json=json_body, timeout=timeout)
+        if resp.status_code in _RETRY_STATUS and attempt < max_attempts:
+            ra = resp.headers.get("Retry-After", "")
+            wait = float(ra) if ra.isdigit() else delay
+            logger.warning("HTTP %s from %s — retry %d/%d in %.1fs",
+                           resp.status_code, url, attempt, max_attempts - 1, wait)
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, 30.0)
+            continue
+        break
+    return resp
+
+
+def log_units(resp):
+    """Log Yandex Direct API points from the Units header (format: spent/balance/limit)."""
+    u = resp.headers.get("Units")
+    if not u:
+        return
+    try:
+        spent, balance, limit = (int(x) for x in u.split("/"))
+        level = logging.WARNING if (limit and balance < limit * 0.05) else logging.INFO
+        logger.log(level, "Direct API units: balance %s/%s (spent %s on this call)", balance, limit, spent)
+    except Exception:
+        logger.info("Direct API units: %s", u)
+
+
+def iam_expiry(data, now):
+    """Compute IAM token expiry epoch from the API's expiresAt, with an 11h fallback."""
+    exp = data.get("expiresAt")
+    if exp:
+        try:
+            s = exp.replace("Z", "+00:00")
+            s = re.sub(r"(\.\d{6})\d+", r"\1", s)  # trim sub-microsecond precision
+            return datetime.datetime.fromisoformat(s).timestamp() - 60
+        except Exception:
+            logger.debug("Could not parse IAM expiresAt=%r, using 11h fallback", exp)
+    return now + 11 * 3600
+
+# Per-call Client-Login (agency multi-account). Set by the dispatcher in server.py.
+client_login_var = contextvars.ContextVar("client_login", default="")
+
+# Toggled from server.py via set_log_bodies(); when False, request/response bodies are not logged.
+_LOG_BODIES = False
+
+
+def set_log_bodies(enabled: bool):
+    global _LOG_BODIES
+    _LOG_BODIES = bool(enabled)
+
+
+def _log_body(prefix, *args):
+    if _LOG_BODIES:
+        logger.debug(prefix, *args)
+
+
+def annotate_partial(data):
+    """Surface Yandex Direct per-item Errors/Warnings (partial success) at the top level.
+
+    Direct v5 returns 200 OK even when individual items fail; the failures live inside
+    result.<List>[i].Errors / .Warnings. Without this, a half-failed bulk add looks like success.
+    """
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        return data
+    issues = []
+    for key, val in result.items():
+        if not isinstance(val, list):
+            continue
+        for idx, item in enumerate(val):
+            if not isinstance(item, dict):
+                continue
+            if item.get("Errors"):
+                issues.append({"list": key, "index": idx, "level": "error", "messages": item["Errors"]})
+            if item.get("Warnings"):
+                issues.append({"list": key, "index": idx, "level": "warning", "messages": item["Warnings"]})
+    if issues:
+        error_count = sum(1 for i in issues if i["level"] == "error")
+        data = dict(data)
+        data["_partial_success"] = {
+            "ok": error_count == 0,
+            "error_count": error_count,
+            "warning_count": len(issues) - error_count,
+            "issues": issues,
+        }
+    return data
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -20,15 +122,17 @@ async def _api(client, service, method, params, *, base_url, token, login="", ti
     url = f"{base_url}/{service}"
     body = {"method": method, "params": params}
     headers = {"Authorization": f"Bearer {token}", "Accept-Language": "ru", "Content-Type": "application/json"}
-    if login:
-        headers["Client-Login"] = login
-    logger.debug("EXTRA REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=headers, json=body, timeout=timeout)
+    eff_login = client_login_var.get("") or login
+    if eff_login:
+        headers["Client-Login"] = eff_login
+    _log_body("EXTRA REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
+    resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=timeout)
+    log_units(resp)
     data = resp.json()
-    logger.debug("EXTRA RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
+    _log_body("EXTRA RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
         raise Exception(f"API error {data['error'].get('error_code')}: {data['error'].get('error_detail', data['error'].get('error_string'))}")
-    return data
+    return annotate_partial(data)
 
 
 async def _api501(client, service, method, params, *, base_url, token, login="", timeout=120, **_kwargs):
@@ -36,15 +140,17 @@ async def _api501(client, service, method, params, *, base_url, token, login="",
     url = base_url.replace("/v5", "/v501") + f"/{service}"
     body = {"method": method, "params": params}
     headers = {"Authorization": f"Bearer {token}", "Accept-Language": "ru", "Content-Type": "application/json"}
-    if login:
-        headers["Client-Login"] = login
-    logger.debug("EXTRA v501 REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=headers, json=body, timeout=timeout)
+    eff_login = client_login_var.get("") or login
+    if eff_login:
+        headers["Client-Login"] = eff_login
+    _log_body("EXTRA v501 REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
+    resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=timeout)
+    log_units(resp)
     data = resp.json()
-    logger.debug("EXTRA v501 RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
+    _log_body("EXTRA v501 RESPONSE %s: %s", resp.status_code, json.dumps(data, ensure_ascii=False)[:2000])
     if "error" in data:
         raise Exception(f"API error {data['error'].get('error_code')}: {data['error'].get('error_detail', data['error'].get('error_string'))}")
-    return data
+    return annotate_partial(data)
 
 
 # IAM token cache (shared)
@@ -63,7 +169,7 @@ async def _get_iam(client, oauth_token):
     if "iamToken" not in data:
         raise Exception(f"Failed to get IAM token: {data}")
     _iam_cache["token"] = data["iamToken"]
-    _iam_cache["expires"] = now + 11 * 3600
+    _iam_cache["expires"] = iam_expiry(data, now)
     return _iam_cache["token"]
 
 
