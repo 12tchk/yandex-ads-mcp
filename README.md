@@ -167,6 +167,15 @@ YD_MCP_ENV_FILE=/secure/path/yandex-ads-mcp.env \
 Wrapper повторно принудительно задаёт read-only ограничения после загрузки env.
 Подробная роль шлюза в DirectOps описана в `docs/directops-integration.md`.
 
+Live-smoke не печатает логины, ID или названия кампаний; только количество,
+состояния и результат негативных проверок:
+
+```bash
+venv/bin/python deploy/smoke_readonly.py \
+  --env-file /secure/path/yandex-ads-mcp.env \
+  --client-login exact-allowlisted-login
+```
+
 ---
 
 ## Полный список инструментов
