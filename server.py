@@ -16,7 +16,7 @@ import stat
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, ToolAnnotations, TextContent
 
 # ── Config ─────────────────────────────────────────────────────────────
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1042,7 +1042,19 @@ def _augment_schema(tool: Tool) -> Tool:
             "type": "boolean",
             "description": "Must be true to execute this mutating call (YD_CONFIRM is enabled).",
         })
-    return Tool(name=tool.name, description=tool.description, inputSchema=schema)
+    mutating = _is_mutating(tool.name)
+    annotations = ToolAnnotations(
+        readOnlyHint=not mutating,
+        destructiveHint=mutating,
+        idempotentHint=not mutating,
+        openWorldHint=True,
+    )
+    return Tool(
+        name=tool.name,
+        description=tool.description,
+        inputSchema=schema,
+        annotations=annotations,
+    )
 
 
 def _tool_catalog() -> list[Tool]:

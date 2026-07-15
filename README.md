@@ -145,6 +145,7 @@ Wordstat API работает через Yandex Cloud. Нужен **платёж
 - **Read-only по умолчанию** — write-инструменты не только отклоняются, но и не публикуются клиенту MCP.
 - **Двойное включение записи** — одновременно нужны `YD_READONLY=false` и `YD_WRITE_ARMED=true`; неоднозначная конфигурация останавливает сервер.
 - **Точный tool allowlist** — production-сервер показывает только значения из `YD_ENABLED_TOOLS`; пустой список закрывает весь интерфейс.
+- **MCP tool annotations** — read-инструменты публикуются с `readOnlyHint=true`, поэтому Codex может безопасно выполнять их в non-interactive режиме; write-инструменты помечаются destructive.
 - **Обязательный project scope** — каждый Direct-вызов требует явный `client_login`, который должен точно входить в `YD_ALLOWED_LOGINS`.
 - **Confirm-режим** — даже намеренно включённый write-вызов требует `confirm=true`.
 - **Partial-success** — изменяющие ответы Директа разбираются на per-item `Errors`/`Warnings` и сводятся в поле `_partial_success`, чтобы наполовину провалившаяся массовая операция не выглядела как успех.

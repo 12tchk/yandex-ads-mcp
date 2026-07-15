@@ -116,6 +116,8 @@ campaign_props = tools["yd_campaigns_get"].inputSchema["properties"]
 campaign_required = tools["yd_campaigns_get"].inputSchema["required"]
 check("direct tool exposes client_login", "client_login" in campaign_props)
 check("direct tool requires client_login", "client_login" in campaign_required)
+check("read tool advertises readOnlyHint", tools["yd_campaigns_get"].annotations.readOnlyHint is True)
+check("read tool advertises non-destructive", tools["yd_campaigns_get"].annotations.destructiveHint is False)
 check("mutating tool hidden in read-only mode", "yd_campaigns_add" not in tools)
 check("disabled tool hidden", "yd_clients_get" not in tools)
 check("read tool containing '_sets' remains visible", "yd_negative_keywords_sets_get" in tools)
