@@ -3,6 +3,8 @@
 
 No network and no credentials required. Verifies:
   - mutating vs read-only tool classification
+  - exact tool and account allowlists
+  - write tools stay hidden and blocked unless independently armed
   - Direct vs Metrika/Wordstat classification
   - YD_LOG_FILE no longer writes a log file by default
   - partial-success annotation of Direct responses
@@ -12,10 +14,24 @@ Run: python3 test_safety.py
 """
 import os
 import sys
+import asyncio
+import json
+import tempfile
 
 # Token must be present for the module to import cleanly under some setups.
 os.environ.setdefault("YD_OAUTH_TOKEN", "test-token")
-os.environ["YD_CONFIRM"] = "true"  # so schemas advertise the confirm flag
+os.environ["YD_READONLY"] = "true"
+os.environ["YD_WRITE_ARMED"] = "false"
+os.environ["YD_CONFIRM"] = "true"
+os.environ["YD_REQUIRE_LOGIN_ALLOWLIST"] = "true"
+os.environ["YD_ALLOWED_LOGINS"] = "allowed-login"
+os.environ["YD_ENABLED_TOOLS"] = ",".join([
+    "yd_campaigns_get",
+    "yd_campaigns_add",
+    "yd_negative_keywords_sets_get",
+    "yd_report",
+    "yd_metrika_report",
+])
 
 import server  # noqa: E402
 from tools_direct_extra import annotate_partial  # noqa: E402
@@ -43,6 +59,7 @@ READONLY = [
     "yd_wordstat_regions_tree", "yd_metrika_report", "yd_metrika_report_comparison",
     "yd_metrika_counters_get", "yd_metrika_conversions_status",
     "yd_excluded_sites_get", "yd_regions_get", "yd_interests_get",
+    "yd_negative_keywords_sets_get",
 ]
 for n in MUTATING:
     check(f"{n} is mutating", server._is_mutating(n) is True)
@@ -59,6 +76,27 @@ print("== logging default ==")
 check("no log file written by default", server.LOG_FILE == "" and
       not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(server.__file__)), "yandex-ads.log")))
 
+print("== secret file controls ==")
+saved_inline = os.environ.pop("YD_OAUTH_TOKEN", None)
+saved_file = os.environ.pop("YD_OAUTH_TOKEN_FILE", None)
+try:
+    with tempfile.NamedTemporaryFile("w", delete=True) as token_file:
+        token_file.write("file-token")
+        token_file.flush()
+        os.chmod(token_file.name, 0o600)
+        os.environ["YD_OAUTH_TOKEN_FILE"] = token_file.name
+        loaded_token, load_error = server._load_oauth_token()
+        check("600 token file accepted", loaded_token == "file-token" and not load_error)
+        os.chmod(token_file.name, 0o644)
+        _, permission_error = server._load_oauth_token()
+        check("world-readable token file rejected", "permissions" in permission_error)
+finally:
+    os.environ.pop("YD_OAUTH_TOKEN_FILE", None)
+    if saved_inline is not None:
+        os.environ["YD_OAUTH_TOKEN"] = saved_inline
+    if saved_file is not None:
+        os.environ["YD_OAUTH_TOKEN_FILE"] = saved_file
+
 print("== partial-success annotation ==")
 ok = annotate_partial({"result": {"AddResults": [{"Id": 1}]}})
 check("clean result has no _partial_success", "_partial_success" not in ok)
@@ -73,12 +111,78 @@ check("warnings detected", ps.get("warning_count") == 1)
 check("ok flag false on error", ps.get("ok") is False)
 
 print("== schema augmentation ==")
-tools = {t.name: t for t in __import__("asyncio").run(server.list_tools())}
-add_props = tools["yd_campaigns_add"].inputSchema["properties"]
-check("direct tool exposes client_login", "client_login" in add_props)
-check("mutating tool exposes confirm (YD_CONFIRM on)", "confirm" in add_props)
+tools = {t.name: t for t in asyncio.run(server.list_tools())}
+campaign_props = tools["yd_campaigns_get"].inputSchema["properties"]
+campaign_required = tools["yd_campaigns_get"].inputSchema["required"]
+check("direct tool exposes client_login", "client_login" in campaign_props)
+check("direct tool requires client_login", "client_login" in campaign_required)
+check("mutating tool hidden in read-only mode", "yd_campaigns_add" not in tools)
+check("disabled tool hidden", "yd_clients_get" not in tools)
+check("read tool containing '_sets' remains visible", "yd_negative_keywords_sets_get" in tools)
 metrika_props = tools["yd_metrika_report"].inputSchema["properties"]
 check("metrika report has no client_login", "client_login" not in metrika_props)
+
+print("== runtime access controls ==")
+
+
+def body(result):
+    return json.loads(result[0].text)
+
+
+missing_login = body(asyncio.run(server.call_tool("yd_campaigns_get", {})))
+check("missing client_login denied", missing_login.get("denied") is True)
+foreign_login = body(asyncio.run(server.call_tool(
+    "yd_campaigns_get", {"client_login": "foreign-login"}
+)))
+check("foreign client_login denied", foreign_login.get("denied") is True)
+disabled_tool = body(asyncio.run(server.call_tool(
+    "yd_clients_get", {"client_login": "allowed-login"}
+)))
+check("tool outside allowlist denied", disabled_tool.get("denied") is True)
+write_attempt = body(asyncio.run(server.call_tool(
+    "yd_campaigns_add",
+    {"client_login": "allowed-login", "name": "must-not-run", "confirm": True},
+)))
+check("write denied even with confirm", write_attempt.get("denied") is True)
+
+original_dispatch = server._dispatch
+
+
+async def fake_dispatch(name, arguments):
+    return server._result({"ok": True, "tool": name, "arguments": arguments})
+
+
+server._dispatch = fake_dispatch
+try:
+    allowed = body(asyncio.run(server.call_tool(
+        "yd_campaigns_get", {"client_login": "allowed-login"}
+    )))
+finally:
+    server._dispatch = original_dispatch
+check("allowlisted read reaches dispatcher", allowed.get("ok") is True)
+
+print("== startup validation ==")
+try:
+    server._validate_config()
+    valid_config = True
+except RuntimeError:
+    valid_config = False
+check("safe configuration validates", valid_config)
+
+original_readonly = server.READONLY
+original_write_armed = server.WRITE_ARMED
+try:
+    server.READONLY = False
+    server.WRITE_ARMED = False
+    try:
+        server._validate_config()
+        ambiguous_write_rejected = False
+    except RuntimeError:
+        ambiguous_write_rejected = True
+finally:
+    server.READONLY = original_readonly
+    server.WRITE_ARMED = original_write_armed
+check("ambiguous write configuration rejected", ambiguous_write_rejected)
 
 print("== IAM expiresAt parsing ==")
 from tools_direct_extra import iam_expiry  # noqa: E402

@@ -10,6 +10,8 @@ import sys
 import json
 import asyncio
 import logging
+import re
+import stat
 
 import httpx
 from mcp.server import Server
@@ -24,18 +26,48 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _csv_env(name: str) -> tuple[str, ...]:
+    """Read a comma-separated env value without logging its contents."""
+    values = (part.strip() for part in os.environ.get(name, "").split(","))
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
+def _load_oauth_token() -> tuple[str, str]:
+    inline_token = os.environ.get("YD_OAUTH_TOKEN", "").strip()
+    token_file = os.environ.get("YD_OAUTH_TOKEN_FILE", "").strip()
+    if inline_token and token_file:
+        return "", "configure only one of YD_OAUTH_TOKEN or YD_OAUTH_TOKEN_FILE"
+    if not token_file:
+        return inline_token, ""
+    try:
+        info = os.stat(token_file, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            return "", "YD_OAUTH_TOKEN_FILE must be a regular file"
+        if info.st_mode & 0o077:
+            return "", "YD_OAUTH_TOKEN_FILE permissions must be 600 or stricter"
+        with open(token_file, encoding="utf-8") as token_handle:
+            token = token_handle.read().strip()
+        return token, "" if token else "YD_OAUTH_TOKEN_FILE is empty"
+    except OSError as exc:
+        return "", f"cannot read YD_OAUTH_TOKEN_FILE: {exc}"
+
+
 API_URL = os.environ.get("YD_API_URL", "https://api.direct.yandex.com/json/v5")
 SANDBOX_URL = "https://api-sandbox.direct.yandex.com/json/v5"
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat"
-TOKEN = os.environ.get("YD_OAUTH_TOKEN", "")
+TOKEN, TOKEN_LOAD_ERROR = _load_oauth_token()
 YC_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "")
 USE_SANDBOX = _env_bool("YD_SANDBOX")
 LOGIN = os.environ.get("YD_LOGIN", "")  # optional default Client-Login for agency accounts
 
 # Safety / access control
-READONLY = _env_bool("YD_READONLY")   # block every mutating tool (add/update/delete/action/set/...)
-CONFIRM = _env_bool("YD_CONFIRM")     # require confirm=true on every mutating tool
-ALLOWED_LOGINS = [s.strip() for s in os.environ.get("YD_ALLOWED_LOGINS", "").split(",") if s.strip()]
+READONLY = _env_bool("YD_READONLY", True)
+WRITE_ARMED = _env_bool("YD_WRITE_ARMED", False)
+CONFIRM = _env_bool("YD_CONFIRM", True)
+REQUIRE_LOGIN_ALLOWLIST = _env_bool("YD_REQUIRE_LOGIN_ALLOWLIST", True)
+ALLOWED_LOGINS = frozenset(_csv_env("YD_ALLOWED_LOGINS"))
+ENABLED_TOOLS = frozenset(_csv_env("YD_ENABLED_TOOLS"))
+ALLOW_ALL_TOOLS = _env_bool("YD_ALLOW_ALL_TOOLS", False)
 
 # Logging
 LOG_LEVEL = os.environ.get("YD_LOG_LEVEL", "INFO").upper()
@@ -116,18 +148,29 @@ async def _api(client: httpx.AsyncClient, service: str, method: str, params: dic
 
 # ── Access control ─────────────────────────────────────────────────────
 
-_MUTATING_TOKENS = ("_add", "_create", "_update", "_delete", "_action",
-                    "_set", "_toggle", "_link", "_unlink", "_upload")
+_MUTATING_RE = re.compile(
+    r"_(?:add|create|update|delete|action|set|toggle|link|unlink|upload)(?:_|$)"
+)
 
 
 def _is_mutating(name: str) -> bool:
     """True for any tool that changes state (create/update/delete/action/...)."""
-    return any(t in name for t in _MUTATING_TOKENS)
+    return bool(_MUTATING_RE.search(name))
 
 
 def _is_direct(name: str) -> bool:
     """True for Yandex Direct tools (which use Client-Login); Metrika/Wordstat don't."""
     return name.startswith("yd_") and not name.startswith("yd_metrika") and not name.startswith("yd_wordstat")
+
+
+def _tool_enabled(name: str) -> bool:
+    """Expose only tools explicitly selected by the deployment."""
+    return ALLOW_ALL_TOOLS or name in ENABLED_TOOLS
+
+
+def _writes_enabled() -> bool:
+    """Write access needs two independent, intentionally opposite switches."""
+    return not READONLY and WRITE_ARMED
 
 
 def _deny(reason: str):
@@ -988,8 +1031,12 @@ def _augment_schema(tool: Tool) -> Tool:
     if _is_direct(tool.name):
         props.setdefault("client_login", {
             "type": "string",
-            "description": "Optional. Override Client-Login for this call (agency multi-account).",
+            "description": "Required agency Client-Login. Must exactly match the server allowlist.",
         })
+        if REQUIRE_LOGIN_ALLOWLIST:
+            required = schema.setdefault("required", [])
+            if "client_login" not in required:
+                required.append("client_login")
     if CONFIRM and _is_mutating(tool.name):
         props.setdefault("confirm", {
             "type": "boolean",
@@ -998,9 +1045,51 @@ def _augment_schema(tool: Tool) -> Tool:
     return Tool(name=tool.name, description=tool.description, inputSchema=schema)
 
 
+def _tool_catalog() -> list[Tool]:
+    return TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS
+
+
+def _visible_tools() -> list[Tool]:
+    tools = [tool for tool in _tool_catalog() if _tool_enabled(tool.name)]
+    if not _writes_enabled():
+        tools = [tool for tool in tools if not _is_mutating(tool.name)]
+    return tools
+
+
+def _validate_config() -> None:
+    """Fail closed when a production deployment is ambiguous or over-broad."""
+    errors = []
+    if TOKEN_LOAD_ERROR:
+        errors.append(TOKEN_LOAD_ERROR)
+    if not TOKEN or TOKEN.startswith("y0_YOUR_"):
+        errors.append("YD_OAUTH_TOKEN is required")
+    if READONLY and WRITE_ARMED:
+        errors.append("YD_READONLY=true conflicts with YD_WRITE_ARMED=true")
+    if not READONLY and not WRITE_ARMED:
+        errors.append("YD_READONLY=false requires the explicit YD_WRITE_ARMED=true switch")
+    if WRITE_ARMED and not CONFIRM:
+        errors.append("YD_WRITE_ARMED=true requires YD_CONFIRM=true")
+    if not USE_SANDBOX and ALLOW_ALL_TOOLS:
+        errors.append("YD_ALLOW_ALL_TOOLS=true is permitted only in sandbox mode")
+    if not ALLOW_ALL_TOOLS and not ENABLED_TOOLS:
+        errors.append("YD_ENABLED_TOOLS must contain an explicit tool allowlist")
+
+    catalog_names = {tool.name for tool in _tool_catalog()}
+    unknown = sorted(ENABLED_TOOLS - catalog_names)
+    if unknown:
+        errors.append(f"YD_ENABLED_TOOLS contains unknown tools: {', '.join(unknown)}")
+
+    direct_tools = {name for name in ENABLED_TOOLS if _is_direct(name)}
+    if direct_tools and REQUIRE_LOGIN_ALLOWLIST and not ALLOWED_LOGINS:
+        errors.append("YD_ALLOWED_LOGINS is required when Direct tools are enabled")
+
+    if errors:
+        raise RuntimeError("Unsafe Yandex Ads MCP configuration: " + "; ".join(errors))
+
+
 @server.list_tools()
 async def list_tools():
-    return [_augment_schema(t) for t in (TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS)]
+    return [_augment_schema(tool) for tool in _visible_tools()]
 
 
 def _rubles_to_micros(rubles: float) -> int:
@@ -1018,17 +1107,28 @@ async def call_tool(name: str, arguments: dict):
     confirm = bool(arguments.pop("confirm", False))
     mutating = _is_mutating(name)
 
-    # 1) read-only mode
-    if mutating and READONLY:
-        return _deny(f"Tool '{name}' is blocked: server runs in READ-ONLY mode (YD_READONLY=true).")
+    # 1) exact server-side tool allowlist
+    if not _tool_enabled(name):
+        return _deny(f"Tool '{name}' is not enabled by this deployment.")
 
-    # 2) multi-account whitelist (Direct tools only — Metrika/Wordstat ignore Client-Login)
+    # 2) writes require both an off switch and an independent arming switch
+    if mutating and not _writes_enabled():
+        return _deny(f"Tool '{name}' is blocked: server write access is not armed.")
+
+    # 3) multi-account whitelist (Direct tools only — Metrika/Wordstat ignore Client-Login)
     effective_login = req_login or LOGIN
-    if _is_direct(name) and ALLOWED_LOGINS and effective_login and effective_login not in ALLOWED_LOGINS:
-        return _deny(f"Client-Login '{effective_login}' is not in the YD_ALLOWED_LOGINS whitelist.")
+    if _is_direct(name) and REQUIRE_LOGIN_ALLOWLIST:
+        if not ALLOWED_LOGINS:
+            return _deny("Direct access is blocked: the server login allowlist is empty.")
+        if not req_login:
+            return _deny("client_login is required for every Direct tool call.")
+        if req_login not in ALLOWED_LOGINS:
+            return _deny(f"Client-Login '{req_login}' is not in the YD_ALLOWED_LOGINS whitelist.")
 
-    # 3) confirm gate
-    if mutating and CONFIRM and not confirm:
+    # 4) confirmation remains mandatory whenever write access is deliberately armed
+    if mutating and not CONFIRM:
+        return _deny("Mutating tools require YD_CONFIRM=true.")
+    if mutating and not confirm:
         return _confirm_preview(name, arguments, effective_login)
 
     ctx_token = client_login_var.set(req_login or "")
@@ -1987,11 +2087,21 @@ _extra_config = {
 
 
 async def main():
-    if not TOKEN:
-        logger.error("YD_OAUTH_TOKEN environment variable is required")
+    try:
+        _validate_config()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
         sys.exit(1)
-    logger.info("Starting Yandex Ads MCP server (sandbox=%s, tools=%d)",
-                USE_SANDBOX, len(TOOLS) + len(METRIKA_TOOLS) + len(EXTRA_DIRECT_TOOLS))
+    logger.info(
+        "Starting Yandex Ads MCP server "
+        "(sandbox=%s, readonly=%s, write_armed=%s, visible_tools=%d, allowed_logins=%d, body_logging=%s)",
+        USE_SANDBOX,
+        READONLY,
+        WRITE_ARMED,
+        len(_visible_tools()),
+        len(ALLOWED_LOGINS),
+        LOG_BODIES,
+    )
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
